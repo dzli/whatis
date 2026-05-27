@@ -454,9 +454,9 @@ fn train_tficf_classifier() {
             let content_str = std::str::from_utf8(&content[..]).unwrap_or("");
 
             let mut tf: HashMap<String, u32> = HashMap::new();
-            for token in polyglot_tokenizer::get_key_tokens(content_str) {
+            for token in polyglot_tokenizer::get_linguist_tokens(content_str) {
                 if token.len() <= MAX_TOKEN_BYTES {
-                    *tf.entry(token.to_string()).or_insert(0) += 1;
+                    *tf.entry(token).or_insert(0) += 1;
                 }
             }
             if !tf.is_empty() {

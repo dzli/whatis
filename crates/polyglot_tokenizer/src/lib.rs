@@ -1,4 +1,6 @@
+pub mod linguist_tokens;
 pub mod tokenizer;
+pub use linguist_tokens::get_linguist_tokens;
 pub use tokenizer::{Token, Tokenizer};
 
 /// Tokenize the content and return only the identifiers and symbols from the langauge

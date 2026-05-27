@@ -6,11 +6,11 @@ const MAX_TOKEN_BYTES: usize = 32;
 
 pub fn classify_tficf(content: &str, candidates: &[&'static str]) -> &'static str {
     let mut counts: HashMap<u32, u32> = HashMap::new();
-    for token in polyglot_tokenizer::get_key_tokens(content) {
+    for token in polyglot_tokenizer::get_linguist_tokens(content) {
         if token.len() > MAX_TOKEN_BYTES {
             continue;
         }
-        if let Some(&idx) = TFICF_VOCABULARY.get(token) {
+        if let Some(&idx) = TFICF_VOCABULARY.get(token.as_str()) {
             *counts.entry(idx).or_insert(0) += 1;
         }
     }
