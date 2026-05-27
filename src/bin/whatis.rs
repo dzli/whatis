@@ -8,8 +8,8 @@ use std::{
 use clap::{App, Arg};
 use hyperpolyglot::{
     detectors::{
-        classify, get_extension, get_language_from_filename, get_languages_from_extension,
-        get_languages_from_heuristics, get_languages_from_shebang,
+        classify, classify_tficf, get_extension, get_language_from_filename,
+        get_languages_from_extension, get_languages_from_heuristics, get_languages_from_shebang,
     },
     Detection,
 };
@@ -24,6 +24,7 @@ struct Strategies {
     shebang: bool,
     heuristics: bool,
     classifier: bool,
+    use_tficf: bool,
 }
 
 impl Strategies {
@@ -47,11 +48,13 @@ fn main() {
         .arg(Arg::with_name("shebang").short("s").long("shebang").help("Use shebang line"))
         .arg(Arg::with_name("heuristics").short("r").long("heuristics").help("Use regex heuristic rules"))
         .arg(Arg::with_name("classifier").short("c").long("classifier").help("Use Bayesian token classifier"))
+        .arg(Arg::with_name("tficf").long("tficf").help("When the classifier strategy fires, use the TF-ICF cosine-similarity classifier instead of the default naive Bayes one"))
         .get_matches();
 
     let any = ["filename", "extension", "shebang", "heuristics", "classifier"]
         .iter()
         .any(|k| matches.is_present(k));
+    let use_tficf = matches.is_present("tficf");
     let opts = if any {
         Strategies {
             filename: matches.is_present("filename"),
@@ -59,9 +62,17 @@ fn main() {
             shebang: matches.is_present("shebang"),
             heuristics: matches.is_present("heuristics"),
             classifier: matches.is_present("classifier"),
+            use_tficf,
         }
     } else {
-        Strategies { filename: true, extension: true, shebang: true, heuristics: true, classifier: true }
+        Strategies {
+            filename: true,
+            extension: true,
+            shebang: true,
+            heuristics: true,
+            classifier: true,
+            use_tficf,
+        }
     };
 
     let path_arg = matches.value_of("PATH").unwrap();
@@ -165,7 +176,11 @@ fn detect_with(path: &Path, opts: &Strategies) -> io::Result<DetectResult> {
     }
 
     if opts.classifier && candidates.len() != 1 {
-        let lang = classify(content, &candidates);
+        let lang = if opts.use_tficf {
+            classify_tficf(content, &candidates)
+        } else {
+            classify(content, &candidates)
+        };
         return Ok(DetectResult::Found(Detection::Classifier(lang)));
     }
 

@@ -2,7 +2,7 @@ use pcre2::bytes::Regex as PCRERegex;
 use phf_codegen::Map as PhfMap;
 use serde::Deserialize;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs::{self, File},
     io::{BufWriter, Write},
     iter,
@@ -179,6 +179,7 @@ const INTERPRETER_MAP_FILE: &str = "src/codegen/interpreter-language-map.rs";
 const LANGUAGE_INFO_FILE: &str = "src/codegen/language-info-map.rs";
 const LANGUAGE_LIST_FILE: &str = "src/codegen/languages.rs";
 const TOKEN_LOG_PROBABILITY_FILE: &str = "src/codegen/token-log-probabilities.rs";
+const TFICF_MODEL_FILE: &str = "src/codegen/tficf-model.rs";
 
 const HEURISTICS_SOURCE_FILE: &str = "heuristics.yml";
 const LANGUAGE_SOURCE_FILE: &str = "languages.yml";
@@ -200,6 +201,7 @@ fn main() {
     create_disambiguation_heuristics_map(heuristics);
 
     train_classifier();
+    train_tficf_classifier();
 }
 
 fn write_language_list(languages: &LanguageMap) {
@@ -423,6 +425,170 @@ fn train_classifier() {
         &mut file,
         "static TOKEN_LOG_PROBABILITIES: phf::Map<&'static str, phf::Map<&'static str, f64>> =\n{};\n",
         language_token_log_probabilities.build()
+    )
+    .unwrap();
+}
+
+const TFICF_MIN_DOCUMENT_FREQUENCY: u32 = 2;
+
+fn train_tficf_classifier() {
+    let mut samples_by_lang: HashMap<String, Vec<HashMap<String, u32>>> = HashMap::new();
+
+    for entry in fs::read_dir("samples").unwrap() {
+        let dir = entry.unwrap();
+        if !dir.path().is_dir() {
+            continue;
+        }
+        let raw_name = dir.file_name().to_string_lossy().into_owned();
+        let lang = match &raw_name[..] {
+            "Fstar" => String::from("F*"),
+            _ => raw_name,
+        };
+
+        for file_entry in fs::read_dir(dir.path()).unwrap() {
+            let file_entry = file_entry.unwrap();
+            if !file_entry.path().is_file() {
+                continue;
+            }
+            let content = fs::read(file_entry.path()).unwrap();
+            let content_str = std::str::from_utf8(&content[..]).unwrap_or("");
+
+            let mut tf: HashMap<String, u32> = HashMap::new();
+            for token in polyglot_tokenizer::get_key_tokens(content_str) {
+                if token.len() <= MAX_TOKEN_BYTES {
+                    *tf.entry(token.to_string()).or_insert(0) += 1;
+                }
+            }
+            if !tf.is_empty() {
+                samples_by_lang
+                    .entry(lang.clone())
+                    .or_insert_with(Vec::new)
+                    .push(tf);
+            }
+        }
+    }
+
+    let mut docfreq: HashMap<String, u32> = HashMap::new();
+    for samples in samples_by_lang.values() {
+        for sample in samples {
+            for token in sample.keys() {
+                *docfreq.entry(token.clone()).or_insert(0) += 1;
+            }
+        }
+    }
+
+    let mut vocab: Vec<String> = docfreq
+        .iter()
+        .filter_map(|(t, &c)| {
+            if c >= TFICF_MIN_DOCUMENT_FREQUENCY {
+                Some(t.clone())
+            } else {
+                None
+            }
+        })
+        .collect();
+    vocab.sort();
+    let term_to_idx: HashMap<String, u32> = vocab
+        .iter()
+        .enumerate()
+        .map(|(i, t)| (t.clone(), i as u32))
+        .collect();
+
+    let num_langs = samples_by_lang.len() as f64;
+    let mut icf: Vec<f64> = vec![0.0; vocab.len()];
+    for samples in samples_by_lang.values() {
+        let mut terms_in_lang: HashSet<u32> = HashSet::new();
+        for sample in samples {
+            for token in sample.keys() {
+                if let Some(&idx) = term_to_idx.get(token) {
+                    terms_in_lang.insert(idx);
+                }
+            }
+        }
+        for idx in terms_in_lang {
+            icf[idx as usize] += 1.0;
+        }
+    }
+    for v in icf.iter_mut() {
+        *v = (num_langs / *v).ln() + 1.0;
+    }
+
+    let mut centroids: HashMap<String, Vec<(u32, f64)>> = HashMap::new();
+    for (lang, samples) in samples_by_lang.iter() {
+        let mut centroid: HashMap<u32, f64> = HashMap::new();
+        let n = samples.len() as f64;
+        for sample in samples {
+            let mut svec: HashMap<u32, f64> = HashMap::new();
+            for (token, &freq) in sample {
+                if let Some(&idx) = term_to_idx.get(token) {
+                    let tf = 1.0 + (freq as f64).ln();
+                    svec.insert(idx, tf * icf[idx as usize]);
+                }
+            }
+            let norm = svec.values().map(|x| x * x).sum::<f64>().sqrt();
+            if norm > 0.0 {
+                for v in svec.values_mut() {
+                    *v /= norm;
+                }
+            }
+            for (idx, v) in svec {
+                *centroid.entry(idx).or_insert(0.0) += v;
+            }
+        }
+        for v in centroid.values_mut() {
+            *v /= n;
+        }
+        let norm = centroid.values().map(|x| x * x).sum::<f64>().sqrt();
+        if norm > 0.0 {
+            for v in centroid.values_mut() {
+                *v /= norm;
+            }
+        }
+        let mut sorted: Vec<(u32, f64)> = centroid.into_iter().collect();
+        sorted.sort_by_key(|x| x.0);
+        centroids.insert(lang.clone(), sorted);
+    }
+
+    let mut file = BufWriter::new(File::create(TFICF_MODEL_FILE).unwrap());
+
+    let mut idx_value_strs: HashMap<String, String> = HashMap::new();
+    for (token, &idx) in term_to_idx.iter() {
+        idx_value_strs.insert(token.clone(), format!("{}u32", idx));
+    }
+    let mut vocab_map = PhfMap::new();
+    for (token, value) in idx_value_strs.iter() {
+        vocab_map.entry(&token[..], &value[..]);
+    }
+    writeln!(
+        &mut file,
+        "static TFICF_VOCABULARY: phf::Map<&'static str, u32> =\n{};\n",
+        vocab_map.build()
+    )
+    .unwrap();
+
+    write!(&mut file, "static TFICF_ICF: &[f64] = &[").unwrap();
+    for v in &icf {
+        write!(&mut file, "{:?}f64,", v).unwrap();
+    }
+    writeln!(&mut file, "];\n").unwrap();
+
+    let mut centroid_value_strs: HashMap<String, String> = HashMap::new();
+    for (lang, sparse) in centroids.iter() {
+        let mut s = String::from("&[");
+        for (idx, val) in sparse.iter() {
+            s.push_str(&format!("({}u32,{:?}f64),", idx, val));
+        }
+        s.push(']');
+        centroid_value_strs.insert(lang.clone(), s);
+    }
+    let mut centroid_map = PhfMap::new();
+    for (lang, value) in centroid_value_strs.iter() {
+        centroid_map.entry(&lang[..], &value[..]);
+    }
+    writeln!(
+        &mut file,
+        "static TFICF_CENTROIDS: phf::Map<&'static str, &'static [(u32, f64)]> =\n{};\n",
+        centroid_map.build()
     )
     .unwrap();
 }
