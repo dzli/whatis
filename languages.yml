@@ -1959,6 +1959,14 @@ HLSL:
   ace_mode: text
   tm_scope: source.hlsl
   language_id: 145
+HTA:
+  type: programming
+  tm_scope: text.html.basic
+  group: HTML
+  color: "#a78649"
+  extensions:
+  - ".hta"
+  language_id: 900146
 HTML:
   type: markup
   tm_scope: text.html.basic
