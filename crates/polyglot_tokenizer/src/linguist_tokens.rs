@@ -56,7 +56,13 @@ pub fn get_linguist_tokens<'a>(content: &'a str) -> Vec<Cow<'a, str>> {
     while i < raw.len() {
         let (t, pos) = (&raw[i].0, raw[i].1);
         match t {
-            Token::Number(_) | Token::String(_, _, _) => {
+            Token::Number(_) => {
+                i += 1;
+            }
+            Token::String(_, body, _) => {
+                if let Some(shape) = string_shape(body) {
+                    out.push(Cow::Borrowed(shape));
+                }
                 i += 1;
             }
             Token::LineComment(opener, body) => {
@@ -168,6 +174,68 @@ fn is_bracket(s: &str) -> bool {
     matches!(s, "(" | ")" | "[" | "]" | "{" | "}")
 }
 
+/// Classify a string literal body by simple character-class statistics and
+/// return a synthetic pseudo-token name when the shape is distinctive
+/// enough to be useful as a classifier feature. The body must already
+/// have most strings (short, mixed) classified out via the `< 40` short-
+/// circuit so we don't bloat the vocabulary with noise.
+///
+/// Costs O(len) and avoids allocation. Length cap matches MAX_TOKEN_BYTES
+/// in classifier (32) since these names are short.
+fn string_shape(body: &str) -> Option<&'static str> {
+    const MIN_LEN: usize = 40;
+    const LONG_LEN: usize = 256;
+    if body.len() < MIN_LEN {
+        return None;
+    }
+
+    let mut percent = 0u32;
+    let mut hex = 0u32;
+    let mut b64 = 0u32;
+    let mut total = 0u32;
+    for b in body.bytes() {
+        total += 1;
+        if b == b'%' {
+            percent += 1;
+        }
+        let is_hex = (b'0'..=b'9').contains(&b)
+            || (b'a'..=b'f').contains(&b)
+            || (b'A'..=b'F').contains(&b);
+        if is_hex {
+            hex += 1;
+        }
+        let is_b64 = (b'a'..=b'z').contains(&b)
+            || (b'A'..=b'Z').contains(&b)
+            || (b'0'..=b'9').contains(&b)
+            || b == b'+'
+            || b == b'/'
+            || b == b'=';
+        if is_b64 {
+            b64 += 1;
+        }
+    }
+
+    // URI-encoded payloads are the dominant case the classifier needs to
+    // identify (document.write(unescape("%3C..."))-style).
+    if percent * 10 >= total {
+        return Some("STRING:URI-ENCODED");
+    }
+    // >=95% hex digits → likely \x-escape body or hex-encoded payload
+    if hex * 100 >= total * 95 {
+        return Some("STRING:HEX");
+    }
+    // >=95% base64 alphabet → likely base64-encoded blob
+    if b64 * 100 >= total * 95 {
+        return Some("STRING:BASE64");
+    }
+    // Long but nothing distinctive — still useful as "this language tends
+    // to contain very long strings"
+    if body.len() >= LONG_LEN {
+        return Some("STRING:LONG");
+    }
+    None
+}
+
 fn extract_interpreter(after_bang: &str) -> String {
     let line = after_bang.split(['\r', '\n']).next().unwrap_or("");
     let trimmed = line.trim();
@@ -255,11 +323,44 @@ mod tests {
     }
 
     #[test]
-    fn numbers_and_strings_dropped() {
+    fn numbers_and_short_strings_dropped() {
         let toks = get_linguist_tokens(r#"let x = 5; let s = "hi";"#);
         assert!(!contains(&toks, "5"));
         assert!(!contains(&toks, "hi"));
         assert!(contains(&toks, "let"));
+    }
+
+    #[test]
+    fn uri_encoded_string_pseudo_token() {
+        // Lots of `%xx` patterns → URI-ENCODED label
+        let s = "%3Cscript%3E%3Cdocument%3E%3Cwrite%3E%3Cunescape%3E%3Calert%3E";
+        let src = format!("x(\"{}\")", s);
+        let toks = get_linguist_tokens(&src);
+        assert!(contains(&toks, "STRING:URI-ENCODED"), "got {:?}", toks);
+    }
+
+    #[test]
+    fn long_string_pseudo_token() {
+        // Use prose-like content with spaces and punctuation so it doesn't
+        // match BASE64/HEX/URI-ENCODED shapes — only LONG should fire.
+        let body = "hello world this is a long prose-like string. ".repeat(10);
+        let src = format!("y(\"{}\")", body);
+        let toks = get_linguist_tokens(&src);
+        assert!(contains(&toks, "STRING:LONG"), "got {:?}", toks);
+    }
+
+    #[test]
+    fn base64_string_pseudo_token() {
+        let body = "U29mdHdhcmUgaXMgZWF0aW5nIHRoZSB3b3JsZC4gQWxsIHRoaXMgaXMganVzdCB0ZXh0Lg==";
+        let src = format!("decode(\"{}\")", body);
+        let toks = get_linguist_tokens(&src);
+        assert!(contains(&toks, "STRING:BASE64"), "got {:?}", toks);
+    }
+
+    #[test]
+    fn short_string_no_pseudo_token() {
+        let toks = get_linguist_tokens(r#"y("hello world")"#);
+        assert!(!toks.iter().any(|t| t.starts_with("STRING:")));
     }
 
     #[test]

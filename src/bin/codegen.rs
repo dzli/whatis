@@ -430,6 +430,8 @@ fn train_classifier() {
 }
 
 const TFICF_MIN_DOCUMENT_FREQUENCY: u32 = 2;
+// Must match TF_CAP in src/detectors/tficf_classifier.rs.
+const TFICF_TF_CAP: u32 = 100;
 
 fn train_tficf_classifier() {
     let mut samples_by_lang: HashMap<String, Vec<HashMap<String, u32>>> = HashMap::new();
@@ -521,7 +523,8 @@ fn train_tficf_classifier() {
             let mut svec: HashMap<u32, f64> = HashMap::new();
             for (token, &freq) in sample {
                 if let Some(&idx) = term_to_idx.get(token) {
-                    let tf = 1.0 + (freq as f64).ln();
+                    let capped = freq.min(TFICF_TF_CAP);
+                    let tf = 1.0 + (capped as f64).ln();
                     svec.insert(idx, tf * icf[idx as usize]);
                 }
             }
