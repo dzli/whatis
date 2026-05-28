@@ -1,8 +1,28 @@
-use pcre2::bytes::RegexBuilder as PCRERegex;
+use pcre2::bytes::{Regex, RegexBuilder as PCRERegex};
+use std::cell::RefCell;
+use std::collections::HashMap;
 
 // Include the map from interpreters to languages at compile time
 // static DISAMBIGUATIONS: phf::Map<&'static str, &'static [Rule]> = ...;
 include!("../codegen/disambiguation-heuristics-map.rs");
+
+thread_local! {
+    static REGEX_CACHE: RefCell<HashMap<&'static str, Regex>> = RefCell::new(HashMap::new());
+}
+
+fn matches_pattern(pattern: &'static str, content: &str, on_error: bool) -> bool {
+    REGEX_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        let regex = cache.entry(pattern).or_insert_with(|| {
+            PCRERegex::new()
+                .crlf(true)
+                .multi_line(true)
+                .build(pattern)
+                .unwrap()
+        });
+        regex.is_match(content.as_bytes()).unwrap_or(on_error)
+    })
+}
 
 #[derive(Debug)]
 enum Pattern {
@@ -21,22 +41,8 @@ struct Rule {
 impl Pattern {
     fn matches(&self, content: &str) -> bool {
         match self {
-            Pattern::Positive(pattern) => {
-                let regex = PCRERegex::new()
-                    .crlf(true)
-                    .multi_line(true)
-                    .build(pattern)
-                    .unwrap();
-                regex.is_match(content.as_bytes()).unwrap_or(false)
-            }
-            Pattern::Negative(pattern) => {
-                let regex = PCRERegex::new()
-                    .crlf(true)
-                    .multi_line(true)
-                    .build(pattern)
-                    .unwrap();
-                !regex.is_match(content.as_bytes()).unwrap_or(true)
-            }
+            Pattern::Positive(pattern) => matches_pattern(pattern, content, false),
+            Pattern::Negative(pattern) => !matches_pattern(pattern, content, true),
             Pattern::Or(patterns) => patterns.iter().any(|pattern| pattern.matches(content)),
             Pattern::And(patterns) => patterns.iter().all(|pattern| pattern.matches(content)),
         }

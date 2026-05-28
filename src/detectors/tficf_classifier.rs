@@ -5,12 +5,12 @@ include!("../codegen/tficf-model.rs");
 const MAX_TOKEN_BYTES: usize = 32;
 
 pub fn classify_tficf(content: &str, candidates: &[&'static str]) -> &'static str {
-    let mut counts: HashMap<u32, u32> = HashMap::new();
+    let mut counts: HashMap<u32, u32> = HashMap::with_capacity(content.len() / 8);
     for token in polyglot_tokenizer::get_linguist_tokens(content) {
         if token.len() > MAX_TOKEN_BYTES {
             continue;
         }
-        if let Some(&idx) = TFICF_VOCABULARY.get(token.as_str()) {
+        if let Some(&idx) = TFICF_VOCABULARY.get(&*token) {
             *counts.entry(idx).or_insert(0) += 1;
         }
     }
@@ -30,23 +30,24 @@ pub fn classify_tficf(content: &str, candidates: &[&'static str]) -> &'static st
     }
     query.sort_by_key(|x| x.0);
 
-    let iter_langs: Box<dyn Iterator<Item = &&'static str>> = if candidates.is_empty() {
-        Box::new(TFICF_CENTROIDS.keys())
-    } else {
-        Box::new(candidates.iter())
-    };
-
     let mut best_lang: &'static str = "";
     let mut best_score = f64::NEG_INFINITY;
-    for &lang in iter_langs {
-        let centroid = match TFICF_CENTROIDS.get(lang) {
-            Some(c) => c,
-            None => continue,
-        };
-        let score = cosine_dot(&query, centroid);
-        if score > best_score {
-            best_score = score;
-            best_lang = lang;
+    let mut score_one = |lang: &'static str| {
+        if let Some(centroid) = TFICF_CENTROIDS.get(lang) {
+            let score = cosine_dot(&query, centroid);
+            if score > best_score {
+                best_score = score;
+                best_lang = lang;
+            }
+        }
+    };
+    if candidates.is_empty() {
+        for &lang in TFICF_CENTROIDS.keys() {
+            score_one(lang);
+        }
+    } else {
+        for &lang in candidates {
+            score_one(lang);
         }
     }
 

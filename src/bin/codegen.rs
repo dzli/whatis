@@ -456,7 +456,7 @@ fn train_tficf_classifier() {
             let mut tf: HashMap<String, u32> = HashMap::new();
             for token in polyglot_tokenizer::get_linguist_tokens(content_str) {
                 if token.len() <= MAX_TOKEN_BYTES {
-                    *tf.entry(token).or_insert(0) += 1;
+                    *tf.entry(token.into_owned()).or_insert(0) += 1;
                 }
             }
             if !tf.is_empty() {

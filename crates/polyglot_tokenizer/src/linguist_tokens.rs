@@ -1,6 +1,12 @@
 use crate::tokenizer::{Token, Tokenizer};
+use std::borrow::Cow;
 
 /// Emit Linguist-style tokens for classifier training/inference.
+///
+/// Returns `Vec<Cow<'a, str>>` to avoid allocating for the common case where
+/// the output token is a slice of the input (raw idents, single-char symbols,
+/// coalesced operator runs). Synthesized tokens (`SHEBANG#!…`, sigil idents)
+/// and rare comment openers are owned `String`s.
 ///
 /// Differences from `get_key_tokens`:
 /// * Line and block comments become typed tokens like `COMMENT#`, `COMMENT//`,
@@ -14,6 +20,9 @@ use crate::tokenizer::{Token, Tokenizer};
 ///   tokenizer treats `#` as a line-comment opener.
 /// * Adjacent symbol characters with no intervening whitespace/token are
 ///   combined into a single token (`==`, `!=`, `->`, `=>`, `<<=`, etc.).
+///   Brackets `()[]{}` are intentionally never coalesced; without this carve-
+///   out, bracket-heavy inputs (e.g. JSFuck) collapse into one mega-token
+///   that the classifier's per-token length cap then discards.
 ///
 /// Numbers and string literals are dropped, same as `get_key_tokens`.
 ///
@@ -23,11 +32,11 @@ use crate::tokenizer::{Token, Tokenizer};
 /// rather than `Token::BlockComment`. As a result, `COMMENT/*` and friends
 /// are rarely emitted in practice; line-comment typing (`COMMENT#`,
 /// `COMMENT//`, `COMMENT--`, `COMMENT%`) works as expected.
-pub fn get_linguist_tokens(content: &str) -> Vec<String> {
+pub fn get_linguist_tokens<'a>(content: &'a str) -> Vec<Cow<'a, str>> {
     let content_base = content.as_ptr() as usize;
     let token_pos = |s: &str| -> usize { s.as_ptr() as usize - content_base };
 
-    let raw: Vec<(Token, usize)> = Tokenizer::new(content)
+    let raw: Vec<(Token<'a>, usize)> = Tokenizer::new(content)
         .tokens()
         .map(|t| {
             let pos = match &t {
@@ -42,7 +51,7 @@ pub fn get_linguist_tokens(content: &str) -> Vec<String> {
 
     let first_newline = content.find('\n').unwrap_or(content.len());
 
-    let mut out = Vec::with_capacity(raw.len());
+    let mut out: Vec<Cow<'a, str>> = Vec::with_capacity(raw.len());
     let mut i = 0;
     while i < raw.len() {
         let (t, pos) = (&raw[i].0, raw[i].1);
@@ -51,59 +60,56 @@ pub fn get_linguist_tokens(content: &str) -> Vec<String> {
                 i += 1;
             }
             Token::LineComment(opener, body) => {
-                // The base tokenizer captures `#` as the opener even when the
-                // line starts with `#!` — recombine the `!` from the body so
-                // we get a real `COMMENT#!` or shebang token.
                 let starts_with_bang = body.starts_with('!');
-                let effective_opener: String =
-                    if *opener == "#" && starts_with_bang { "#!".into() } else { (*opener).into() };
-
-                if effective_opener == "#!" && pos < first_newline {
-                    let interp_src = &body[1..];
-                    let interp = extract_interpreter(interp_src);
-                    out.push(format!("SHEBANG#!{}", interp));
+                if *opener == "#" && starts_with_bang && pos < first_newline {
+                    let interp = extract_interpreter(&body[1..]);
+                    let mut s = String::with_capacity(9 + interp.len());
+                    s.push_str("SHEBANG#!");
+                    s.push_str(&interp);
+                    out.push(Cow::Owned(s));
                 } else {
-                    out.push(format!("COMMENT{}", effective_opener));
+                    out.push(line_comment_token(opener, starts_with_bang));
                 }
                 i += 1;
             }
             Token::BlockComment(opener, _, _) => {
-                out.push(format!("COMMENT{}", opener));
+                out.push(block_comment_token(opener));
                 i += 1;
             }
             Token::Ident(s) => {
-                out.push((*s).to_string());
+                out.push(Cow::Borrowed(*s));
                 i += 1;
             }
             Token::Symbol(s) => {
-                // Sigil + adjacent ident → combine (no `#` because base
-                // tokenizer commits `#` to line-comment parsing).
+                // Sigil + adjacent ident → combine into one owned token.
                 if matches!(*s, "@" | "$" | ".") && i + 1 < raw.len() {
                     let next = &raw[i + 1];
                     if pos + s.len() == next.1 {
                         if let Token::Ident(ident_s) = &next.0 {
-                            out.push(format!("{}{}", s, ident_s));
+                            let mut owned = String::with_capacity(s.len() + ident_s.len());
+                            owned.push_str(s);
+                            owned.push_str(ident_s);
+                            out.push(Cow::Owned(owned));
                             i += 2;
                             continue;
                         }
                     }
                 }
-                // Maximal-munch adjacent same-class symbol chars. Brackets
-                // never coalesce — emit them individually. Coalescing only
-                // applies to operator-class chars so JSFuck and other
-                // bracket-heavy inputs stay tokenizable.
+                // Brackets emit individually so bracket-heavy inputs stay
+                // tokenizable.
                 if is_bracket(s) {
-                    out.push((*s).to_string());
+                    out.push(Cow::Borrowed(*s));
                     i += 1;
                     continue;
                 }
-                let mut combined = String::from(*s);
+                // Maximal-munch adjacent non-bracket operator-class chars.
+                // Because the run is contiguous in source, we borrow a slice
+                // of `content` rather than allocating.
                 let mut end_pos = pos + s.len();
                 let mut j = i + 1;
                 while j < raw.len() {
                     if let Token::Symbol(next_s) = &raw[j].0 {
                         if raw[j].1 == end_pos && !is_bracket(next_s) {
-                            combined.push_str(next_s);
                             end_pos += next_s.len();
                             j += 1;
                             continue;
@@ -111,13 +117,51 @@ pub fn get_linguist_tokens(content: &str) -> Vec<String> {
                     }
                     break;
                 }
-                out.push(combined);
+                out.push(Cow::Borrowed(&content[pos..end_pos]));
                 i = j;
             }
         }
     }
 
     out
+}
+
+fn line_comment_token(opener: &str, starts_with_bang: bool) -> Cow<'static, str> {
+    if opener == "#" && starts_with_bang {
+        return Cow::Borrowed("COMMENT#!");
+    }
+    match opener {
+        "//" => Cow::Borrowed("COMMENT//"),
+        "///" => Cow::Borrowed("COMMENT///"),
+        "#" => Cow::Borrowed("COMMENT#"),
+        "##" => Cow::Borrowed("COMMENT##"),
+        "--" => Cow::Borrowed("COMMENT--"),
+        "%" => Cow::Borrowed("COMMENT%"),
+        _ => {
+            let mut s = String::with_capacity(7 + opener.len());
+            s.push_str("COMMENT");
+            s.push_str(opener);
+            Cow::Owned(s)
+        }
+    }
+}
+
+fn block_comment_token(opener: &str) -> Cow<'static, str> {
+    match opener {
+        "/*" => Cow::Borrowed("COMMENT/*"),
+        "/**" => Cow::Borrowed("COMMENT/**"),
+        "<!--" => Cow::Borrowed("COMMENT<!--"),
+        "{-" => Cow::Borrowed("COMMENT{-"),
+        "(*" => Cow::Borrowed("COMMENT(*"),
+        "\"\"\"" => Cow::Borrowed("COMMENT\"\"\""),
+        "'''" => Cow::Borrowed("COMMENT'''"),
+        _ => {
+            let mut s = String::with_capacity(7 + opener.len());
+            s.push_str("COMMENT");
+            s.push_str(opener);
+            Cow::Owned(s)
+        }
+    }
 }
 
 fn is_bracket(s: &str) -> bool {
@@ -154,16 +198,20 @@ fn extract_interpreter(after_bang: &str) -> String {
 mod tests {
     use super::*;
 
+    fn contains(toks: &[Cow<'_, str>], needle: &str) -> bool {
+        toks.iter().any(|t| t == needle)
+    }
+
     #[test]
     fn shebang_simple() {
         let toks = get_linguist_tokens("#!/usr/bin/python\nprint(1)\n");
-        assert_eq!(toks[0], "SHEBANG#!python");
+        assert_eq!(&*toks[0], "SHEBANG#!python");
     }
 
     #[test]
     fn shebang_env() {
         let toks = get_linguist_tokens("#!/usr/bin/env python\nx = 1\n");
-        assert_eq!(toks[0], "SHEBANG#!python");
+        assert_eq!(&*toks[0], "SHEBANG#!python");
     }
 
     #[test]
@@ -175,50 +223,68 @@ mod tests {
     #[test]
     fn line_comments_typed() {
         let toks = get_linguist_tokens("// a\n# b\n-- c\n% d\n");
-        assert!(toks.contains(&"COMMENT//".to_string()));
-        assert!(toks.contains(&"COMMENT#".to_string()));
-        assert!(toks.contains(&"COMMENT--".to_string()));
-        assert!(toks.contains(&"COMMENT%".to_string()));
+        assert!(contains(&toks, "COMMENT//"));
+        assert!(contains(&toks, "COMMENT#"));
+        assert!(contains(&toks, "COMMENT--"));
+        assert!(contains(&toks, "COMMENT%"));
     }
 
     #[test]
     fn sigil_combines() {
         let toks = get_linguist_tokens("@foo $bar .baz");
-        assert!(toks.contains(&"@foo".to_string()), "got {:?}", toks);
-        assert!(toks.contains(&"$bar".to_string()), "got {:?}", toks);
-        assert!(toks.contains(&".baz".to_string()), "got {:?}", toks);
+        assert!(contains(&toks, "@foo"));
+        assert!(contains(&toks, "$bar"));
+        assert!(contains(&toks, ".baz"));
     }
 
     #[test]
     fn dot_sigil_combines_after_ident() {
         let toks = get_linguist_tokens("foo.bar");
-        assert!(toks.iter().any(|t| t == "foo"));
-        assert!(toks.iter().any(|t| t == ".bar"));
+        assert!(contains(&toks, "foo"));
+        assert!(contains(&toks, ".bar"));
     }
 
     #[test]
     fn multi_char_symbols() {
         let toks = get_linguist_tokens("a -> b => c != d <= e :: f");
-        assert!(toks.contains(&"->".to_string()), "expected -> got {:?}", toks);
-        assert!(toks.contains(&"=>".to_string()), "expected => got {:?}", toks);
-        assert!(toks.contains(&"!=".to_string()), "expected != got {:?}", toks);
-        assert!(toks.contains(&"<=".to_string()), "expected <= got {:?}", toks);
-        assert!(toks.contains(&"::".to_string()), "expected :: got {:?}", toks);
+        assert!(contains(&toks, "->"));
+        assert!(contains(&toks, "=>"));
+        assert!(contains(&toks, "!="));
+        assert!(contains(&toks, "<="));
+        assert!(contains(&toks, "::"));
     }
 
     #[test]
     fn numbers_and_strings_dropped() {
         let toks = get_linguist_tokens(r#"let x = 5; let s = "hi";"#);
-        assert!(!toks.iter().any(|t| t == "5"));
-        assert!(!toks.iter().any(|t| t == "hi"));
-        assert!(toks.iter().any(|t| t == "let"));
+        assert!(!contains(&toks, "5"));
+        assert!(!contains(&toks, "hi"));
+        assert!(contains(&toks, "let"));
     }
 
     #[test]
     fn separated_symbols_dont_combine() {
         let toks = get_linguist_tokens("a ! = b");
-        assert!(!toks.contains(&"!=".to_string()));
-        assert!(toks.contains(&"!".to_string()));
-        assert!(toks.contains(&"=".to_string()));
+        assert!(!contains(&toks, "!="));
+        assert!(contains(&toks, "!"));
+        assert!(contains(&toks, "="));
+    }
+
+    #[test]
+    fn coalesced_operator_is_borrowed() {
+        // For a contiguous operator run like `->`, the output should be a
+        // Borrowed slice into the input (no heap allocation).
+        let content = "a->b";
+        let toks = get_linguist_tokens(content);
+        let arrow = toks.iter().find(|t| t == &"->").unwrap();
+        assert!(matches!(arrow, Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn ident_is_borrowed() {
+        let toks = get_linguist_tokens("foo bar");
+        for t in &toks {
+            assert!(matches!(t, Cow::Borrowed(_)), "unexpected owned: {:?}", t);
+        }
     }
 }

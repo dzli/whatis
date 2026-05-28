@@ -166,8 +166,13 @@ pub fn detect(path: &Path) -> Result<Option<Detection>, std::io::Error> {
     };
     reader.seek(SeekFrom::Start(0))?;
 
-    let mut content = String::new();
-    reader.read_to_string(&mut content)?;
+    // Read at most MAX_CONTENT_SIZE_BYTES (+ slack so truncate_to_char_boundary
+    // can step back to a valid UTF-8 boundary). Avoids slurping multi-MB data
+    // files into memory just to throw most away.
+    const READ_SLACK: usize = 8;
+    let cap = MAX_CONTENT_SIZE_BYTES + READ_SLACK;
+    let mut content = String::with_capacity(cap);
+    reader.take(cap as u64).read_to_string(&mut content)?;
     let content = truncate_to_char_boundary(&content, MAX_CONTENT_SIZE_BYTES);
 
     // using heuristics is only going to be useful if we have more than one candidate
