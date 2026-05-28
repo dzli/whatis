@@ -191,27 +191,33 @@ fn string_shape(body: &str) -> Option<&'static str> {
 
     let mut percent = 0u32;
     let mut hex = 0u32;
+    let mut hex_letters = 0u32; // a-f/A-F only (excludes 0-9)
     let mut b64 = 0u32;
+    let mut b64_letters = 0u32; // a-z/A-Z only (excludes digits/padding)
     let mut total = 0u32;
     for b in body.bytes() {
         total += 1;
         if b == b'%' {
             percent += 1;
         }
-        let is_hex = (b'0'..=b'9').contains(&b)
-            || (b'a'..=b'f').contains(&b)
+        let is_hex_digit = (b'0'..=b'9').contains(&b);
+        let is_hex_letter = (b'a'..=b'f').contains(&b)
             || (b'A'..=b'F').contains(&b);
-        if is_hex {
+        if is_hex_digit || is_hex_letter {
             hex += 1;
         }
-        let is_b64 = (b'a'..=b'z').contains(&b)
-            || (b'A'..=b'Z').contains(&b)
-            || (b'0'..=b'9').contains(&b)
-            || b == b'+'
-            || b == b'/'
-            || b == b'=';
-        if is_b64 {
+        if is_hex_letter {
+            hex_letters += 1;
+        }
+        let is_b64_digit = (b'0'..=b'9').contains(&b);
+        let is_b64_letter = (b'a'..=b'z').contains(&b)
+            || (b'A'..=b'Z').contains(&b);
+        if is_b64_letter || is_b64_digit || b == b'+' || b == b'/' || b == b'='
+        {
             b64 += 1;
+        }
+        if is_b64_letter {
+            b64_letters += 1;
         }
     }
 
@@ -220,12 +226,16 @@ fn string_shape(body: &str) -> Option<&'static str> {
     if percent * 10 >= total {
         return Some("STRING:URI-ENCODED");
     }
-    // >=95% hex digits → likely \x-escape body or hex-encoded payload
-    if hex * 100 >= total * 95 {
+    // >=95% hex digits with at least some hex letters (a-f) → likely
+    // \x-escape body or hex-encoded payload. Pure-digit strings (e.g. VBA
+    // ChrW/Mid decimal codes) must not match; they aren't hex-encoded.
+    if hex * 100 >= total * 95 && hex_letters > 0 {
         return Some("STRING:HEX");
     }
-    // >=95% base64 alphabet → likely base64-encoded blob
-    if b64 * 100 >= total * 95 {
+    // >=95% base64 alphabet with at least some letters → likely
+    // base64-encoded blob. Pure-digit strings (e.g. VBA ChrW/Mid decimal
+    // codes) must not match; they aren't base64.
+    if b64 * 100 >= total * 95 && b64_letters > 0 {
         return Some("STRING:BASE64");
     }
     // Long but nothing distinctive — still useful as "this language tends
@@ -361,6 +371,44 @@ mod tests {
     fn short_string_no_pseudo_token() {
         let toks = get_linguist_tokens(r#"y("hello world")"#);
         assert!(!toks.iter().any(|t| t.starts_with("STRING:")));
+    }
+
+    #[test]
+    fn pure_digit_string_not_hex() {
+        // VBA ChrW/Mid decimal-code strings: all digits, no hex letters →
+        // must NOT get STRING:HEX (would misroute to JavaScript+HexString).
+        let body = "039032098106110098102110010079112116105111110032069120112108".repeat(3);
+        let src = format!("khqwh = \"{}\"", body);
+        let toks = get_linguist_tokens(&src);
+        assert!(
+            !contains(&toks, "STRING:HEX"),
+            "pure-digit string should not get STRING:HEX, got {:?}",
+            toks
+        );
+    }
+
+    #[test]
+    fn hex_string_with_letters() {
+        // Continuous hex-encoded payload (as it appears inside a string literal
+        // after concatenation) with actual a-f letters → should get STRING:HEX.
+        let body = "48656c6c6f20576f726c642e486572650s20616e6f746865722074657374".repeat(3);
+        let src = format!("t = \"{}\"", body);
+        let toks = get_linguist_tokens(&src);
+        assert!(contains(&toks, "STRING:HEX"), "got {:?}", toks);
+    }
+
+    #[test]
+    fn pure_digit_string_not_base64() {
+        // VBA ChrW/Mid decimal-code strings: all digits, no letters →
+        // must NOT get STRING:BASE64 (would misroute to Jupyter Notebook).
+        let body = "039032098106110098102110010079112116105111110032069120112108".repeat(3);
+        let src = format!("khqwh = \"{}\"", body);
+        let toks = get_linguist_tokens(&src);
+        assert!(
+            !contains(&toks, "STRING:BASE64"),
+            "pure-digit string should not get STRING:BASE64, got {:?}",
+            toks
+        );
     }
 
     #[test]
