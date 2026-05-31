@@ -178,7 +178,44 @@ pub(crate) fn detect_opener(content: &str) -> Option<&'static str> {
     if s.starts_with("<?xml") {
         return Some("OPENER<?xml");
     }
+    // `<script language="VBScript">` (or any case variant of the language
+    // attribute) at offset 0. Catches bare-script-fragment droppers whose
+    // body is huge hex shellcode the tokenizer can't fully parse, leaving
+    // them with only a handful of tokens that score poorly against any
+    // language centroid. The case-insensitive scan is over a small window.
+    if starts_with_ascii_ci(s, "<script") {
+        let after = &s[7..];
+        let win = &after[..after.len().min(64)].to_ascii_lowercase();
+        if win.contains("vbscript") && !win.contains("javascript") {
+            return Some("OPENER<script>VBScript");
+        }
+    }
+    // `<!DOCTYPE html` at offset 0 (case-insensitive). Catches both HTML5
+    // (`<!DOCTYPE html>`) and XHTML 1.0/HTML 4.01 PUBLIC variants. Files that
+    // are real HTML but whose body is dominated by oddball tokens (asterisk-
+    // separated obfuscated payloads, embedded long base64 strings, etc.)
+    // can lose to adjacent centroids like Graphviz or GSP without this.
+    if starts_with_ascii_ci(s, "<!DOCTYPE html") {
+        return Some("OPENER<!DOCTYPE>html");
+    }
+    // Bare `<html` (case-insensitive) at offset 0, when followed by a tag-
+    // terminator. Covers DOCTYPE-less HTML fragments. The terminator check
+    // avoids matching `<htmltag>` or other unrelated identifiers.
+    if starts_with_ascii_ci(s, "<html") {
+        let after = s.as_bytes().get(5).copied();
+        if matches!(after, Some(b'>') | Some(b' ') | Some(b'\n') | Some(b'\r') | Some(b'\t') | None) {
+            return Some("OPENER<html>");
+        }
+    }
     None
+}
+
+fn starts_with_ascii_ci(s: &str, prefix: &str) -> bool {
+    s.len() >= prefix.len()
+        && s.as_bytes()[..prefix.len()]
+            .iter()
+            .zip(prefix.bytes())
+            .all(|(a, b)| a.eq_ignore_ascii_case(&b))
 }
 
 fn line_comment_token(opener: &str, starts_with_bang: bool) -> Cow<'static, str> {
@@ -482,6 +519,60 @@ mod tests {
     fn opener_xml() {
         let toks = get_linguist_tokens("<?xml version=\"1.0\"?>\n<root/>");
         assert_eq!(&*toks[0], "OPENER<?xml");
+    }
+
+    #[test]
+    fn opener_script_vbscript_offset_0() {
+        let toks = get_linguist_tokens("<script language=\"VBScript\">\nFunction Foo()\nEnd Function\n</script>");
+        assert_eq!(&*toks[0], "OPENER<script>VBScript");
+    }
+
+    #[test]
+    fn opener_script_vbscript_case_insensitive() {
+        let toks = get_linguist_tokens("<SCRIPT LANGUAGE=\"vbscript\">\nDim x\n</SCRIPT>");
+        assert_eq!(&*toks[0], "OPENER<script>VBScript");
+    }
+
+    #[test]
+    fn opener_script_javascript_does_not_match() {
+        let toks = get_linguist_tokens("<script language=\"JavaScript\">\nvar x = 1;\n</script>");
+        assert!(!contains(&toks, "OPENER<script>VBScript"));
+    }
+
+    #[test]
+    fn opener_doctype_html5() {
+        let toks = get_linguist_tokens("<!DOCTYPE html>\n<html><body></body></html>");
+        assert_eq!(&*toks[0], "OPENER<!DOCTYPE>html");
+    }
+
+    #[test]
+    fn opener_doctype_xhtml() {
+        let toks = get_linguist_tokens("<!DOCTYPE html PUBLIC \"-//W3C//DTD XHTML 1.0 Transitional//EN\">\n<html/>");
+        assert_eq!(&*toks[0], "OPENER<!DOCTYPE>html");
+    }
+
+    #[test]
+    fn opener_doctype_lowercase() {
+        let toks = get_linguist_tokens("<!doctype html>\n<html/>");
+        assert_eq!(&*toks[0], "OPENER<!DOCTYPE>html");
+    }
+
+    #[test]
+    fn opener_bare_html_tag() {
+        let toks = get_linguist_tokens("<html>\n<head></head><body/></html>");
+        assert_eq!(&*toks[0], "OPENER<html>");
+    }
+
+    #[test]
+    fn opener_bare_html_with_attrs() {
+        let toks = get_linguist_tokens("<html lang=\"en\">\n<body/></html>");
+        assert_eq!(&*toks[0], "OPENER<html>");
+    }
+
+    #[test]
+    fn opener_htmltag_does_not_match() {
+        let toks = get_linguist_tokens("<htmltag foo>bar</htmltag>");
+        assert!(!contains(&toks, "OPENER<html>"));
     }
 
     #[test]

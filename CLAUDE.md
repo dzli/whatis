@@ -95,7 +95,16 @@ No `build.rs` triggers codegen automatically — you must run it manually after 
 - **`#var` sigil combining is impossible** because the base tokenizer commits `#` to line-comment parsing. `@var`, `$var`, `.bar` work.
 - **`MAX_TOKEN_BYTES = 32`** filters out tokens longer than 32 bytes at both training and classification time. Brackets `()[]{}` are intentionally never coalesced in the linguist tokenizer — without this exception, JSFuck-style bracket-heavy input would collapse into one giant token that the cap silently discards.
 - **`whatis` takes only one PATH argument** (not multiple). Glob/expand in the shell instead.
-- **`OPENER<?php` / `<?hh` / `<?xml` synthetic tokens** are emitted 100 times when the file starts with the matching marker (after an optional BOM). Both `get_linguist_tokens` (TF-ICF) and `get_key_tokens` (Bayes) share the same `detect_opener()` and `OPENER_EMIT_COUNT` so both classifiers see the same opener signal. The repetition saturates `TFICF_TF_CAP = 100` for TF-ICF and dominates the per-token log-prob sum for Bayes.
+- **`OPENER<…>` synthetic tokens** are emitted 100 times when the file starts with one of these markers at offset 0 (after an optional BOM). The repetition saturates `TFICF_TF_CAP = 100` for TF-ICF and dominates the per-token log-prob sum for Bayes. Both `get_linguist_tokens` (TF-ICF) and `get_key_tokens` (Bayes) share the same `detect_opener()` and `OPENER_EMIT_COUNT`.
+
+  | Marker (case-insensitive parts noted) | Pseudo-token | Anchors detection of |
+  |---|---|---|
+  | `<?php` | `OPENER<?php` | PHP |
+  | `<?hh` | `OPENER<?hh` | Hack |
+  | `<?xml` | `OPENER<?xml` | XML |
+  | `<script` then `vbscript` in next 64 chars (case-ins.) | `OPENER<script>VBScript` | VBScript |
+  | `<!DOCTYPE html` (case-ins.) | `OPENER<!DOCTYPE>html` | HTML |
+  | `<html` followed by `>` / space / newline / EOF (case-ins.) | `OPENER<html>` | HTML |
 
 ## TODO / future improvements
 

@@ -1921,19 +1921,6 @@ Groovy:
   filenames:
   - Jenkinsfile
   language_id: 142
-Groovy Server Pages:
-  type: programming
-  group: Groovy
-  aliases:
-  - gsp
-  - java server page
-  extensions:
-  - ".gsp"
-  tm_scope: text.html.jsp
-  ace_mode: jsp
-  codemirror_mode: htmlembedded
-  codemirror_mime_type: application/x-jsp
-  language_id: 143
 HAProxy:
   type: data
   extensions:
@@ -5723,6 +5710,14 @@ VBScript:
   codemirror_mode: vbscript
   codemirror_mime_type: text/vbscript
   language_id: 408016005
+VBScript+HTMLDecoy:
+  type: programming
+  tm_scope: source.vbnet
+  group: VBScript
+  color: "#15dcdc"
+  extensions:
+  - ".vbs"
+  language_id: 900500
 VCL:
   type: programming
   color: "#148AA8"
